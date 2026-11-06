@@ -1,0 +1,3 @@
+.env
+security/certs/*.key
+security/certs/*.crt

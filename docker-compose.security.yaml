@@ -1,0 +1,68 @@
+# Security override for the official Airflow 3 docker-compose.yaml.
+#   docker compose up -d      (.env sets COMPOSE_FILE to both files; or pass -f for each)
+# Needs Docker Compose >= 2.24.4 (uses !reset). Secrets come from .env (see scripts/setup_security.sh).
+#
+# What it does:  Airflow UI/API no longer on 8080 (internal 9091, not published at all)
+#                -> only nginx is published, with TLS, on 127.0.0.1:8443 by default
+#                login via FAB auth manager (real users/roles), random secrets, hardened API settings
+
+x-airflow-security-env: &airflow-security-env
+  AIRFLOW__API__PORT: "9091"                                   # was 8080
+  AIRFLOW__CORE__EXECUTION_API_SERVER_URL: "http://airflow-apiserver:9091/execution/"   # workers -> API server
+  AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
+  AIRFLOW__FAB__CONFIG_FILE: /opt/airflow/config/webserver_config.py
+  AIRFLOW__FAB__SESSION_LIFETIME_MINUTES: "480"
+  AIRFLOW__API_AUTH__JWT_SECRET: ${AIRFLOW_JWT_SECRET:?run scripts/setup_security.sh}     # the compose default is a public string
+  AIRFLOW__API__SECRET_KEY: ${AIRFLOW_API_SECRET_KEY:?run scripts/setup_security.sh}
+  AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:?run scripts/setup_security.sh}         # encrypts connection passwords
+  AIRFLOW__API__BASE_URL: ${AIRFLOW_BASE_URL:-https://localhost:8443}
+  AIRFLOW__API__EXPOSE_CONFIG: "False"
+  AIRFLOW__API__ENABLE_SWAGGER_UI: "False"
+  AIRFLOW__API__EXPOSE_STACKTRACE: "False"
+  AIRFLOW__API__REQUIRE_CONFIRMATION_DAG_CHANGE: "True"
+  AIRFLOW__CORE__LOAD_EXAMPLES: "False"
+  CONFIG_DB_DSN: postgresql://postgres:${CONFIG_DB_PASSWORD:?run scripts/setup_security.sh}@configdb:5432/config
+  CONFIG_CACHE_URL: redis://redis:6379/5
+
+services:
+  airflow-apiserver:
+    command: api-server --proxy-headers
+    environment:
+      <<: *airflow-security-env
+      FORWARDED_ALLOW_IPS: "*"           # trust X-Forwarded-* from nginx (only reachable on the internal network)
+    ports: !reset []                     # nothing published: no 8080, no 9091 on the host
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:9091/api/v2/monitor/health"]
+  airflow-scheduler:
+    environment: *airflow-security-env
+  airflow-dag-processor:
+    environment: *airflow-security-env
+  airflow-worker:
+    environment: *airflow-security-env
+  airflow-triggerer:
+    environment: *airflow-security-env
+  airflow-init:
+    environment: *airflow-security-env
+
+  nginx:                                 # the ONLY published entry point, TLS terminated here
+    image: nginx:1.27-alpine
+    restart: always
+    depends_on: [airflow-apiserver]
+    ports:
+      - "${AIRFLOW_BIND_ADDRESS:-127.0.0.1}:${AIRFLOW_PUBLIC_PORT:-8443}:8443"
+    volumes:
+      - ./security/nginx/airflow.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./security/certs:/etc/nginx/certs:ro
+
+  configdb:                              # your config DB: password from .env, not published to the host
+    image: postgres:16
+    restart: always
+    environment:
+      POSTGRES_PASSWORD: ${CONFIG_DB_PASSWORD:?run scripts/setup_security.sh}
+      POSTGRES_DB: config
+    ports: !reset []
+    volumes:
+      - config-db-data:/var/lib/postgresql/data
+
+volumes:
+  config-db-data:
