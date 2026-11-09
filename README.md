@@ -105,10 +105,10 @@ The bundled sample (`sql/002_sample_data.sql`) also shows nested task groups, a 
 
 ## ⚡ Quick start
 
-You need Docker Compose 2.24.4 or newer, `bash` and `openssl`. Replace `<your-user>` with the repository owner.
+You need Docker Compose 2.24.4 or newer, `bash` and `openssl`.
 
 ```bash
-git clone https://github.com/<your-user>/rowflow.git && cd rowflow
+git clone https://github.com/rejanuis/rowflow.git && cd rowflow
 curl -LfO 'https://airflow.apache.org/docs/apache-airflow/stable/docker-compose.yaml'
 bash scripts/setup_security.sh                       # random secrets + dev TLS certificate
 
