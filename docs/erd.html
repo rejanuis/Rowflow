@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Rowflow: interactive ERD</title>
+<style>
+:root{--bg:#fff;--card:#f6f8fb;--text:#1b2230;--muted:#5f6b7e;--line:#aab3c5;--accent:#2563eb;--pk:#b45309;--fk:#7c3aed;--bd:#d6dbe6;--sel:#e8f0ff}
+@media (prefers-color-scheme:dark){:root{--bg:#0f131b;--card:#171c27;--text:#e7eaf1;--muted:#9aa5b8;--line:#4a5469;--accent:#6aa5ff;--pk:#fbbf24;--fk:#c4b5fd;--bd:#2b3243;--sel:#1b2c4a}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
+header,main,#info{max-width:1100px;margin:0 auto;padding:0 20px}
+header{padding-top:24px}
+h1{font-size:1.5rem;margin:0 0 4px}
+header p{margin:0 0 14px;color:var(--muted)}
+.bar{display:flex;flex-wrap:wrap;gap:12px;align-items:center;margin-bottom:14px}
+input[type=search]{flex:1 1 220px;max-width:320px;padding:8px 10px;border:1px solid var(--bd);border-radius:8px;background:var(--card);color:var(--text);font:inherit}
+button{padding:8px 12px;border:1px solid var(--bd);border-radius:8px;background:var(--card);color:var(--text);font:inherit;cursor:pointer}
+label{color:var(--muted);display:flex;gap:6px;align-items:center}
+.wrap{overflow-x:auto;padding-bottom:8px}
+#board{position:relative;display:grid;grid-template-columns:repeat(3,minmax(250px,1fr));gap:30px 84px;min-width:880px;padding:6px 4px 12px}
+.col{display:flex;flex-direction:column;gap:28px;align-self:start}
+#lines{position:absolute;left:0;top:0;pointer-events:none;overflow:visible}
+.card{position:relative;z-index:1;background:var(--card);border:1px solid var(--bd);border-radius:10px;cursor:pointer;transition:opacity .15s,box-shadow .15s}
+.card h2{margin:0;padding:9px 12px;font:600 .95rem ui-monospace,SFMono-Regular,Menlo,monospace;border-bottom:1px solid var(--bd)}
+.card ul{list-style:none;margin:0;padding:4px 0}
+.card li{display:grid;grid-template-columns:42px 1fr auto;gap:6px;padding:2px 12px;font:.8rem ui-monospace,SFMono-Regular,Menlo,monospace}
+.card li .ty{color:var(--muted)}
+.k b{font-size:.62rem;margin-right:3px;padding:0 3px;border-radius:3px;border:1px solid currentColor}
+.k .pk{color:var(--pk)}.k .fk{color:var(--fk)}
+.card:hover{box-shadow:0 0 0 1px var(--accent)}
+.card:focus-visible,.card.sel{outline:2px solid var(--accent);background:var(--sel)}
+.dim{opacity:.25}
+.notypes .ty{display:none}
+.rel path{fill:none;stroke:var(--line);stroke-width:1.6}
+.rel.logical path{stroke-dasharray:5 4}
+.rel .p{fill:var(--line)}.rel .c{fill:var(--bg);stroke:var(--line);stroke-width:1.5}
+.rel.on path{stroke:var(--accent);stroke-width:2.6}
+.rel.on .p{fill:var(--accent)}.rel.on .c{stroke:var(--accent)}
+.rel.off{opacity:.12}
+#info{padding-top:6px;padding-bottom:32px}
+#info section{border:1px solid var(--bd);border-radius:10px;padding:14px 16px;background:var(--card)}
+#info h3{margin:0 0 4px;font:600 1rem ui-monospace,SFMono-Regular,Menlo,monospace}
+#info ul{margin:8px 0 0;padding-left:20px}
+.legend{color:var(--muted);font-size:.85rem;margin:6px 0 0}
+code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.9em}
+</style>
+</head>
+<body>
+<header>
+  <h1>Rowflow: data model</h1>
+  <p>Click a table to see how it connects. Search filters tables and columns. Hover a column for its meaning.</p>
+  <div class="bar">
+    <input id="q" type="search" placeholder="Search tables or columns…" aria-label="Search tables or columns">
+    <label><input id="types" type="checkbox" checked> show column types</label>
+    <button id="reset" type="button">Reset</button>
+  </div>
+</header>
+<main>
+  <div class="wrap"><div id="board"><svg id="lines" aria-hidden="true"></svg></div></div>
+  <p class="legend">Line ends: <b>●</b> filled = referenced (parent) column, <b>○</b> hollow = referencing (child) column. Dashed = logical link without a foreign key. The <code>v_dag_metadata</code> view joins these tables into one row per DAG for the sync job.</p>
+</main>
+<div id="info" aria-live="polite"></div>
+<script>
+const T={
+dag_config:{d:"One row per DAG. Project and team map to the DAG in the UI.",c:[
+["dag_id","text","pk","Airflow DAG id: letters, digits, _ . - only"],["team_name","text","","Owning team"],["project_name","text","","Project name; unique per team"],
+["description","text","",""],["schedule","text","","Cron or preset; empty means manual only"],["start_date","date","",""],["max_active_runs","int","",""],
+["default_args","jsonb","",""],["tags","text[]","",""],["owner_email","text","",""],["is_active","bool","","Soft-delete switch"],
+["content_hash","text","","Written by the sync job"],["config_updated_at","timestamptz","","Bumped by triggers when any child row changes"]]},
+dag_config_history:{d:"Every published version of a DAG, for audit and diffs. Automatic rollback is not implemented.",c:[
+["id","bigserial","pk",""],["dag_id","text","fk","Logical link, no foreign key"],["content_hash","text","",""],["payload","jsonb","","Full payload as published"],["created_at","timestamptz","",""]]},
+sync_log:{d:"One row per sync outcome: written, failed or removed.",c:[
+["id","bigserial","pk",""],["run_at","timestamptz","",""],["dag_id","text","fk","Logical link, no foreign key"],["status","text","","written | failed | removed"],["message","text","","Validation error text"]]},
+task_group_config:{d:"Task groups, nestable through parent_group.",c:[
+["dag_id","text","pk fk",""],["group_id","text","pk",""],["parent_group","text","fk","Empty for top-level groups"]]},
+task_config:{d:"One row per task. The task id is the ETL name in the UI.",c:[
+["dag_id","text","pk fk",""],["task_id","text","pk","ETL name in the UI"],["group_id","text","fk","Optional task group"],["task_type","text","fk","gcs_to_bq, bq_to_bq, pg_to_bq, bq_to_files"],
+["source_config","jsonb","","Source settings"],["sink_config","jsonb","","Sink settings"],["mapping","jsonb","","List of overrides: one mapped task instance per entry"],
+["params","jsonb","","retries, pool, retry_delay_seconds"],["is_active","bool","","Soft-delete switch"]]},
+task_type_catalog:{d:"Available source-to-sink task types. Drives the source and sink pickers of the planned UI.",c:[
+["task_type","text","pk",""],["source_type","text","",""],["sink_type","text","",""],["config_schema","jsonb","","For form generation"]]},
+task_dependency:{d:"Edges of the task graph: upstream runs before downstream.",c:[
+["dag_id","text","pk fk",""],["upstream","text","pk fk","Task that runs first"],["downstream","text","pk fk","Task that runs after"]]}
+};
+const R=[
+{f:"task_group_config.dag_id",t:"dag_config.dag_id"},
+{f:"task_group_config.parent_group",t:"task_group_config.group_id"},
+{f:"task_config.dag_id",t:"dag_config.dag_id"},
+{f:"task_config.group_id",t:"task_group_config.group_id"},
+{f:"task_config.task_type",t:"task_type_catalog.task_type"},
+{f:"task_dependency.upstream",t:"task_config.task_id"},
+{f:"task_dependency.downstream",t:"task_config.task_id"},
+{f:"dag_config_history.dag_id",t:"dag_config.dag_id",l:1},
+{f:"sync_log.dag_id",t:"dag_config.dag_id",l:1}];
+const cols=[["dag_config","dag_config_history","sync_log"],["task_group_config","task_config"],["task_type_catalog","task_dependency"]];
+const $=s=>document.querySelector(s),board=$("#board"),svg=$("#lines");let sel=null;
+const colOf=n=>cols.findIndex(c=>c.includes(n));
+const card=n=>`<article class="card" id="t-${n}" data-t="${n}" tabindex="0"><h2>${n}</h2><ul>${T[n].c.map(([c,ty,f,note])=>`<li data-c="${c}" title="${note}"><span class="k">${f.split(" ").filter(Boolean).map(x=>`<b class="${x}">${x.toUpperCase()}</b>`).join("")}</span><span>${c}</span><span class="ty">${ty}</span></li>`).join("")}</ul></article>`;
+board.insertAdjacentHTML("beforeend",cols.map(c=>`<div class="col">${c.map(card).join("")}</div>`).join(""));
+function pt(n,c,side){const r=$(`#t-${n} li[data-c="${c}"]`).getBoundingClientRect(),b=board.getBoundingClientRect();return[(side=="r"?r.right:r.left)-b.left,r.top+r.height/2-b.top]}
+function draw(){
+ svg.setAttribute("width",board.scrollWidth);svg.setAttribute("height",board.scrollHeight);
+ svg.innerHTML=R.map((r,i)=>{const[a,ac]=r.f.split("."),[b,bc]=r.t.split("."),ca=colOf(a),cb=colOf(b);
+  const s1=ca==cb?"r":ca<cb?"r":"l",s2=ca==cb?"r":ca<cb?"l":"r";
+  const[x1,y1]=pt(a,ac,s1),[x2,y2]=pt(b,bc,s2),dx=ca==cb?64:Math.max(40,Math.abs(x2-x1)/2);
+  const c1=x1+(s1=="r"?dx:-dx),c2=x2+(s2=="r"?dx:-dx);
+  return`<g class="rel${r.l?" logical":""}" data-i="${i}"><path d="M${x1} ${y1}C${c1} ${y1} ${c2} ${y2} ${x2} ${y2}"/><circle class="c" cx="${x1}" cy="${y1}" r="3.5"/><circle class="p" cx="${x2}" cy="${y2}" r="3.5"/></g>`}).join("");
+ if(sel)mark(sel)}
+function related(n){const s=new Set([n]);R.forEach(r=>{const a=r.f.split(".")[0],b=r.t.split(".")[0];if(a==n||b==n){s.add(a);s.add(b)}});return s}
+function mark(n){const rel=related(n);
+ document.querySelectorAll(".card").forEach(c=>{c.classList.toggle("sel",c.dataset.t==n);c.classList.toggle("dim",!rel.has(c.dataset.t))});
+ svg.querySelectorAll(".rel").forEach((g,i)=>{const on=R[i].f.startsWith(n+".")||R[i].t.startsWith(n+".");g.classList.toggle("on",on);g.classList.toggle("off",!on)})}
+function info(n){const el=$("#info");
+ if(!n){el.innerHTML=`<section><h3>Pick a table</h3><p class="legend">Seven tables: <code>dag_config</code> holds DAGs, <code>task_group_config</code> and <code>task_config</code> hold groups and tasks, <code>task_dependency</code> holds upstream and downstream links, and the remaining tables hold the type catalog, history and sync log.</p></section>`;return}
+ const t=T[n],pks=t.c.filter(c=>c[2].includes("pk")).map(c=>c[0]).join(", ");
+ const out=R.filter(r=>r.f.startsWith(n+".")).map(r=>`<li><code>${r.f}</code> references <code>${r.t}</code>${r.l?" (logical link, no foreign key)":""}</li>`);
+ const inn=R.filter(r=>r.t.startsWith(n+".")&&!r.f.startsWith(n+".")).map(r=>`<li><code>${r.f}</code> references this table</li>`);
+ el.innerHTML=`<section><h3>${n}</h3><div>${t.d}</div><div class="legend">Primary key: <code>${pks}</code></div><ul>${out.concat(inn).join("")||"<li>No relationships</li>"}</ul></section>`}
+function select(n){sel=n;mark(n);info(n)}
+function reset(){sel=null;$("#q").value="";document.querySelectorAll(".card").forEach(c=>c.classList.remove("sel","dim"));svg.querySelectorAll(".rel").forEach(g=>g.classList.remove("on","off"));info(null)}
+board.addEventListener("click",e=>{const c=e.target.closest(".card");if(c)select(c.dataset.t)});
+board.addEventListener("keydown",e=>{if((e.key=="Enter"||e.key==" ")&&e.target.classList.contains("card")){e.preventDefault();select(e.target.dataset.t)}});
+document.addEventListener("keydown",e=>{if(e.key=="Escape")reset()});
+$("#reset").onclick=reset;
+$("#q").addEventListener("input",e=>{const q=e.target.value.trim().toLowerCase();sel=null;svg.querySelectorAll(".rel").forEach(g=>g.classList.remove("on","off"));info(null);
+ document.querySelectorAll(".card").forEach(c=>{c.classList.remove("sel");const t=T[c.dataset.t],hit=!q||c.dataset.t.includes(q)||t.c.some(x=>x[0].includes(q));c.classList.toggle("dim",!hit)})});
+$("#types").onchange=e=>{board.classList.toggle("notypes",!e.target.checked);draw()};
+new ResizeObserver(draw).observe(board);addEventListener("load",draw);document.fonts&&document.fonts.ready.then(draw);
+info(null);draw();
+</script>
+</body>
+</html>

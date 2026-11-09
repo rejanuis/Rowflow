@@ -1,14 +1,14 @@
-"""Pure-python validation (no Airflow imports) shared by the sync job and the DAG factory."""
+"""Pure-Python validation (no Airflow imports), shared by the sync job and the DAG generator.
+
+Generic rules live here (ids, groups, dependency graph). Rules for each task type live in
+task_types/<type>/spec.py.
+"""
 import re
-from graphlib import TopologicalSorter, CycleError
+from graphlib import CycleError, TopologicalSorter
+
+from .task_types import TASK_TYPES, get_spec
 
 ID_RE = re.compile(r"^[A-Za-z0-9_.-]{1,250}$")
-REQUIRED = {   # task_type -> required keys as "source.x" / "sink.x"
-    "gcs_to_bq":   ["source.bucket", "source.objects", "sink.table"],
-    "bq_to_bq":    ["source.sql", "sink.table"],
-    "pg_to_bq":    ["source.conn_id", "source.sql", "source.staging_bucket", "sink.table"],
-    "bq_to_files": ["source.table", "sink.uri"],
-}
 ALLOWED_PARAMS = {"retries", "pool", "retry_delay_seconds"}
 
 
@@ -17,18 +17,44 @@ class ConfigError(ValueError):
 
 
 def sort_groups(groups):
-    """Parents first; raises on unknown parent or hierarchy cycle."""
+    """Parents first; raises on an unknown parent or a cycle in the group hierarchy."""
     by_id = {g["group_id"]: g for g in groups}
     graph = {}
     for gid, g in by_id.items():
-        p = g.get("parent_group")
-        if p and p not in by_id:
-            raise ConfigError(f"group '{gid}' has unknown parent '{p}'")
-        graph[gid] = {p} if p else set()
+        parent = g.get("parent_group")
+        if parent and parent not in by_id:
+            raise ConfigError(f"group '{gid}' has unknown parent '{parent}'")
+        graph[gid] = {parent} if parent else set()
     try:
         return [by_id[i] for i in TopologicalSorter(graph).static_order()]
     except CycleError:
         raise ConfigError("cycle in task group hierarchy")
+
+
+def _task_errors(task, group_ids):
+    tid, task_type = task["task_id"], task["task_type"]
+    errors = []
+    if not ID_RE.match(tid):
+        errors.append(f"invalid task_id '{tid}'")
+    if task.get("group_id") and task["group_id"] not in group_ids:
+        errors.append(f"unknown group '{task['group_id']}'")
+    bad = set(task.get("params", {})) - ALLOWED_PARAMS
+    if bad:
+        errors.append(f"disallowed params {sorted(bad)}")
+    if task_type not in TASK_TYPES:
+        return [*errors, f"unknown task_type '{task_type}'"]
+
+    spec = get_spec(task_type)
+    mapping = task.get("mapping")
+    if mapping is not None and not (isinstance(mapping, list) and all(isinstance(m, dict) for m in mapping)):
+        return [*errors, "mapping must be a list of objects"]
+    if mapping and not spec.supports_mapping:
+        errors.append(f"mapping not supported for {task_type}")
+    for entry in mapping or [{}]:          # with mapping, every entry together with the base must be complete
+        source = {**task.get("source_config", {}), **entry.get("source", {})}
+        sink = {**task.get("sink_config", {}), **entry.get("sink", {})}
+        errors += spec.validate(source, sink)
+    return list(dict.fromkeys(errors))
 
 
 def validate(cfg):
@@ -41,40 +67,23 @@ def validate(cfg):
     ids = [t["task_id"] for t in tasks]
     if len(ids) != len(set(ids)):
         errs.append("duplicate task_id")
-    errs += [f"invalid task_id '{i}'" for i in ids if not ID_RE.match(i)]
     try:
         sort_groups(cfg.get("groups", []))
     except ConfigError as e:
         errs.append(str(e))
-    gids = {g["group_id"] for g in cfg.get("groups", [])}
-    for t in tasks:
-        tid, tt = t["task_id"], t["task_type"]
-        if t.get("group_id") and t["group_id"] not in gids:
-            errs.append(f"{tid}: unknown group '{t['group_id']}'")
-        if tt not in REQUIRED:
-            errs.append(f"{tid}: unknown task_type '{tt}'")
-            continue
-        for e in (t.get("mapping") or [{}]):                   # with mapping, each entry must complete the config
-            for key in REQUIRED[tt]:
-                side, k = key.split(".")
-                v = {**t.get(f"{side}_config", {}), **e.get(side, {})}
-                if v.get(k) in (None, "", []):
-                    errs.append(f"{tid}: missing {key}")
-        if t.get("mapping") and tt == "pg_to_bq":
-            errs.append(f"{tid}: mapping not supported for pg_to_bq (composite task)")
-        bad = set(t.get("params", {})) - ALLOWED_PARAMS
-        if bad:
-            errs.append(f"{tid}: disallowed params {sorted(bad)}")
-    # upstream / downstream checks
-    graph = {i: set() for i in ids}
-    for d in cfg.get("dependencies", []):
-        u, v = d["upstream"], d["downstream"]
-        if u not in graph or v not in graph:
-            errs.append(f"dependency {u}->{v} references unknown/inactive task")
-        elif u == v:
-            errs.append(f"self dependency on {u}")
+    group_ids = {g["group_id"] for g in cfg.get("groups", [])}
+    for task in tasks:
+        errs += [f"{task['task_id']}: {m}" for m in _task_errors(task, group_ids)]
+
+    graph = {i: set() for i in ids}                            # upstream / downstream checks
+    for dep in cfg.get("dependencies", []):
+        up, down = dep["upstream"], dep["downstream"]
+        if up not in graph or down not in graph:
+            errs.append(f"dependency {up}->{down} references unknown/inactive task")
+        elif up == down:
+            errs.append(f"self dependency on {up}")
         else:
-            graph[v].add(u)
+            graph[down].add(up)
     try:
         TopologicalSorter(graph).prepare()
     except CycleError as e:

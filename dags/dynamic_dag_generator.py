@@ -1,5 +1,8 @@
-# airflow dag generator -- SINGLE FILE for dynamic DAG + task group + task generation.
-# Reads ONLY the metadata-cache (Redis). It never connects to the config database.
+# airflow dag generator -- the ONE file that turns cached metadata into Airflow DAGs.
+# It reads ONLY the metadata-cache (Redis) and never connects to the config database.
+#
+# Flow:  cache -> load_configs() -> build_dag() -> _build_task() -> task_types/<type>/build.py
+# Every source-to-sink type lives in its own folder: dag_factory/task_types/<type>/{spec.py,build.py}.
 import json
 import logging
 import os
@@ -7,99 +10,50 @@ import re
 from datetime import datetime, timedelta
 
 from airflow.sdk import DAG, TaskGroup
-from dag_factory.validation import validate, sort_groups     # shared with the sync job
+from dag_factory.task_types import get_builder
+from dag_factory.validation import sort_groups, validate
 
 log = logging.getLogger(__name__)
 N_SHARDS = int(os.environ.get("DAG_SHARDS", "1"))             # keep equal to the sync job's value
 
 
-# ---- 1. task type registry: task_type -> (operator class, kwargs). Lazy imports = cheap parse ----
-def _split(table):
-    p, d, t = table.split(".")
-    return {"projectId": p, "datasetId": d, "tableId": t}
+# ---- tasks ----
+def _common_args(task):
+    """Operator arguments shared by every task type (from task_config.params)."""
+    args = dict(task.get("params", {}))
+    if "retry_delay_seconds" in args:
+        args["retry_delay"] = timedelta(seconds=args.pop("retry_delay_seconds"))
+    return args
 
 
-def gcs_to_bq(tid, src, snk):
-    from airflow.providers.google.cloud.transfers.gcs_to_bigquery import GCSToBigQueryOperator
-    fmt = src.get("format", "CSV")
-    kw = dict(bucket=src["bucket"], source_objects=src["objects"],
-              destination_project_dataset_table=snk["table"], source_format=fmt,
-              write_disposition=snk.get("write_disposition", "WRITE_APPEND"),
-              create_disposition=snk.get("create_disposition", "CREATE_IF_NEEDED"),
-              autodetect=snk.get("autodetect", True),
-              gcp_conn_id=snk.get("conn_id", "google_cloud_default"))
-    if fmt == "CSV":
-        kw["skip_leading_rows"] = src.get("skip_leading_rows", 1)
-    return GCSToBigQueryOperator, kw
+def _build_task(task):
+    """Create the Airflow object for one task_config row; returns the node to wire dependencies on."""
+    task_id, common = task["task_id"], _common_args(task)
+    build = get_builder(task["task_type"])
+    source, sink = task["source_config"], task["sink_config"]
+
+    if task.get("mapping"):                                    # dynamic task mapping: one instance per entry
+        steps = [build(task_id, {**source, **m.get("source", {})}, {**sink, **m.get("sink", {})})[0]
+                 for m in task["mapping"]]
+        return steps[0].operator.partial(task_id=task_id, **common).expand_kwargs([s.kwargs for s in steps])
+
+    steps = build(task_id, source, sink)
+    if len(steps) == 1:                                        # the usual case: a single operator
+        return steps[0].operator(task_id=task_id, **steps[0].kwargs, **common)
+    with TaskGroup(group_id=task_id) as group:                 # multi-step type: steps run in order
+        previous = None
+        for step in steps:
+            operator = step.operator(task_id=step.name, **step.kwargs, **common)
+            if previous:
+                previous >> operator
+            previous = operator
+    return group
 
 
-def bq_to_bq(tid, src, snk):
-    from airflow.providers.google.cloud.operators.bigquery import BigQueryInsertJobOperator
-    return BigQueryInsertJobOperator, dict(
-        gcp_conn_id=snk.get("conn_id", "google_cloud_default"),
-        configuration={"query": {
-            "query": src["sql"], "useLegacySql": False,
-            "destinationTable": _split(snk["table"]),
-            "writeDisposition": snk.get("write_disposition", "WRITE_TRUNCATE"),
-            "createDisposition": snk.get("create_disposition", "CREATE_IF_NEEDED")}})
-
-
-def bq_to_files(tid, src, snk):
-    from airflow.providers.google.cloud.transfers.bigquery_to_gcs import BigQueryToGCSOperator
-    return BigQueryToGCSOperator, dict(
-        source_project_dataset_table=src["table"], destination_cloud_storage_uris=[snk["uri"]],
-        export_format=snk.get("format", "CSV"), print_header=True,
-        gcp_conn_id=src.get("conn_id", "google_cloud_default"))
-
-
-def pg_to_bq(tid, src, snk):
-    """Composite: Postgres -> GCS staging -> BigQuery (built as a small TaskGroup)."""
-    from airflow.providers.google.cloud.transfers.postgres_to_gcs import PostgresToGCSOperator
-    prefix = src.get("staging_prefix", "staging/airflow") + "/{{ ds_nodash }}/" + tid
-    extract = ("extract", PostgresToGCSOperator, dict(
-        postgres_conn_id=src["conn_id"], sql=src["sql"], bucket=src["staging_bucket"],
-        filename=prefix + "_{}.json", export_format="json",
-        gcp_conn_id=snk.get("conn_id", "google_cloud_default")))
-    load_cls, load_kw = gcs_to_bq(tid, {"bucket": src["staging_bucket"], "objects": [prefix + "_*.json"],
-                                        "format": "NEWLINE_DELIMITED_JSON"}, snk)
-    return [extract, ("load", load_cls, load_kw)]
-
-
-BUILDERS = {"gcs_to_bq": gcs_to_bq, "bq_to_bq": bq_to_bq, "bq_to_files": bq_to_files, "pg_to_bq": pg_to_bq}
-
-
-# ---- 2. task + DAG generation ----
-def _common(t):
-    p = dict(t.get("params", {}))
-    if "retry_delay_seconds" in p:
-        p["retry_delay"] = timedelta(seconds=p.pop("retry_delay_seconds"))
-    return p
-
-
-def _build_task(t):
-    """Returns the node to wire dependencies on (operator, mapped operator, or TaskGroup)."""
-    tid, common = t["task_id"], _common(t)
-    build = BUILDERS[t["task_type"]]
-    src, snk = t["source_config"], t["sink_config"]
-    if t["task_type"] == "pg_to_bq":
-        with TaskGroup(group_id=tid) as g:
-            prev = None
-            for name, cls, kw in build(tid, src, snk):
-                op = cls(task_id=name, **kw, **common)
-                if prev:
-                    prev >> op
-                prev = op
-        return g
-    if t.get("mapping"):                                       # dynamic task mapping
-        merged = [({**src, **m.get("source", {})}, {**snk, **m.get("sink", {})}) for m in t["mapping"]]
-        cls = build(tid, *merged[0])[0]
-        return cls.partial(task_id=tid, **common).expand_kwargs([build(tid, s, k)[1] for s, k in merged])
-    cls, kw = build(tid, src, snk)
-    return cls(task_id=tid, **kw, **common)
-
-
+# ---- dags ----
 def build_dag(cfg):
-    validate(cfg)                                              # cycles, unknown refs, required config
+    """Create one DAG (groups, tasks, dependencies) from a validated metadata payload."""
+    validate(cfg)                                              # cycles, unknown refs, per-type required config
     owner = cfg["team_name"]
     with DAG(dag_id=cfg["dag_id"], schedule=cfg["schedule"], catchup=False,
              start_date=datetime.fromisoformat(cfg["start_date"]),
@@ -111,35 +65,40 @@ def build_dag(cfg):
         for g in sort_groups(cfg["groups"]):                   # parents first
             groups[g["group_id"]] = TaskGroup(g["group_id"], parent_group=groups.get(g.get("parent_group")))
         nodes = {}
-        for t in cfg["tasks"]:
-            grp = groups.get(t.get("group_id"))
-            if grp:
-                with grp:
-                    nodes[t["task_id"]] = _build_task(t)
+        for task in cfg["tasks"]:
+            group = groups.get(task.get("group_id"))
+            if group:
+                with group:
+                    nodes[task["task_id"]] = _build_task(task)
             else:
-                nodes[t["task_id"]] = _build_task(t)
-        for d in cfg["dependencies"]:                          # upstream -> downstream
-            nodes[d["upstream"]] >> nodes[d["downstream"]]
+                nodes[task["task_id"]] = _build_task(task)
+        for dep in cfg["dependencies"]:                        # upstream -> downstream
+            nodes[dep["upstream"]] >> nodes[dep["downstream"]]
     return dag
 
 
-# ---- 3. read the metadata-cache ----
+# ---- metadata-cache ----
 def load_configs():
+    """Read this shard's DAG payloads from Redis, sorted so output is deterministic."""
     import redis
-    m = re.search(r"_(\d+)\.py$", __file__)                    # optional shard copy: dynamic_dag_generator_07.py
-    if N_SHARDS > 1 and not m:
+    match = re.search(r"_(\d+)\.py$", __file__)                # optional shard copy: dynamic_dag_generator_07.py
+    if N_SHARDS > 1 and not match:
         raise RuntimeError("DAG_SHARDS > 1: copy this file as dynamic_dag_generator_00..NN.py")
-    shard = int(m.group(1)) if m else 0
-    r = redis.Redis.from_url(os.environ["CONFIG_CACHE_URL"], socket_timeout=5)
-    raw = r.hgetall(f"metadata:dags:{shard}")
+    shard = int(match.group(1)) if match else 0
+    client = redis.Redis.from_url(os.environ["CONFIG_CACHE_URL"], socket_timeout=5)
+    raw = client.hgetall(f"metadata:dags:{shard}")
     if not raw:
         raise RuntimeError(f"metadata-cache empty for shard {shard}: trigger the metadata_sync DAG in the Airflow UI")
-    return [json.loads(v) for _, v in sorted(raw.items())]    # sorted = deterministic = no phantom DAG versions
+    return [json.loads(value) for _, value in sorted(raw.items())]
 
 
-# ---- 4. generate ----
-for _cfg in load_configs():
-    try:
-        globals()[_cfg["dag_id"]] = build_dag(_cfg)            # module-level global => Airflow discovers it
-    except Exception:
-        log.exception("skipping DAG %s: invalid config", _cfg.get("dag_id"))
+def generate(module_globals):
+    """Build every DAG of this shard. A bad DAG is logged and skipped; the others still load."""
+    for cfg in load_configs():
+        try:
+            module_globals[cfg["dag_id"]] = build_dag(cfg)     # module-level global => Airflow discovers it
+        except Exception:
+            log.exception("skipping DAG %s: invalid config", cfg.get("dag_id"))
+
+
+generate(globals())

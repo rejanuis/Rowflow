@@ -90,9 +90,14 @@ Common validation messages:
 | `unknown task_type` | Use one of the types below |
 | `group 'x' has unknown parent` | Create the parent group first |
 | `DAG has no active tasks` | Add at least one active task |
+| `sink.table must look like project.dataset.table` | Use the full three-part BigQuery table name |
+| `sink.write_disposition must be one of ...` | Use `WRITE_APPEND`, `WRITE_TRUNCATE` or `WRITE_EMPTY` (and `CREATE_IF_NEEDED` / `CREATE_NEVER` for create) |
+| `mapping not supported for pg_to_bq` | Remove `mapping`; multi-step types cannot be mapped |
 | `disallowed params [...]` | `params` may only contain `retries`, `pool`, `retry_delay_seconds` |
 
 ## 5. Task types and their settings
+
+Each type has its own folder with a settings reference: [`dags/dag_factory/task_types/`](../dags/dag_factory/task_types/README.md). Summary:
 
 `source_config` and `sink_config` are JSON. **Bold** keys are required.
 

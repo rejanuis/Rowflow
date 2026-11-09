@@ -1,3 +1,6 @@
 .env
-security/certs/*.key
+.pytest_cache/
+.venv/
+__pycache__/
 security/certs/*.crt
+security/certs/*.key
